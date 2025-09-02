@@ -1,0 +1,24 @@
+{
+  "name": "uniswap-v2-zapper",
+  "version": "1.0.0",
+  "description": "A Node.js script to automate Zap In and Zap Out operation for Uniswap V2 liquidity pool.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NimaZeighami/Uniswap-V2-Zapper.git"
+  },
+  "author": "Nima Zeighami",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/NimaZeighami/Uniswap-V2-Zapper/issues"
+  },
+  "homepage": "https://github.com/NimaZeighami/Uniswap-V2-Zapper#readme",
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "ethers": "^6.15.0"
+  }
+}

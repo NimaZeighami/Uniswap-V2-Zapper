@@ -1,0 +1,8 @@
+{
+    "terminal.integrated.defaultProfile.osx": "zsh",
+    "terminal.integrated.profiles": {
+        "zsh": {
+            "path": "/bin/zsh"
+        }
+    }
+}

@@ -18,7 +18,10 @@
   },
   "homepage": "https://github.com/NimaZeighami/Uniswap-V2-Zapper#readme",
   "dependencies": {
-    "dotenv": "^17.2.1",
-    "ethers": "^6.15.0"
+    "@grammyjs/conversations": "^2.1.0",
+    "@grammyjs/storage-file": "^2.5.1",
+    "dotenv": "^17.2.2",
+    "ethers": "^6.15.0",
+    "grammy": "^1.38.2"
   }
 }

@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "tokenAddress": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "pairAddress": "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852",
+    "initialEthValue": "0.00005",
+    "initialMarketCap": "20233185.811908553875182372",
+    "timestamp": 1757223603104
+  },
+  {
+    "tokenAddress": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "pairAddress": "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852",
+    "initialEthValue": "0.00005",
+    "initialMarketCap": "20233068.501355501492372243",
+    "timestamp": 1757223844094
+  }
+]

@@ -40,7 +40,7 @@ const POSITIONS_FILE_PATH = './positions.json';
 // --- Transaction Parameters ---
 const SLIPPAGE_BPS = 2000; // 20% slippage tolerance
 const DEADLINE_MINUTES = 20; // 20 minutes for transactions to succeed
-const GAS_BUMP_GWEI = 5n; // Add 5 Gwei to the priority fee to speed up transactions. Set to 0n to disable.
+const GAS_BUMP_GWEI = 0n; // Add 5 Gwei to the priority fee to speed up transactions. Set to 0n to disable.
 
 // --- ABIs (Application Binary Interfaces) ---
 const ZAPPER_ABI = [
@@ -121,22 +121,10 @@ async function getPairInfo(tokenOtherAddress) {
         return { pairAddress, price: '0', marketCap: '0' };
     }
 
-    // ========== BUG FIX STARTS HERE ==========
-    // The previous formula was incorrect for tokens without 18 decimals.
-    // This simplified formula correctly calculates the price and market cap
-    // by normalizing the units before the final division.
-
-    // Calculate the price of one full token (e.g., 1 USDT) in Wei.
     const priceInWei = (reserveWETH * (10n ** BigInt(tokenDecimals))) / reserveToken;
-
-    // To get market cap, multiply the price of one token by the total supply of tokens (normalized).
-    // A simpler way that avoids floating points is to calculate total market cap in Wei directly.
-    // MarketCap in WETH's smallest unit (Wei) = (reserveWETH / reserveToken) * tokenTotalSupply
-    // This works because the units for reserveToken and tokenTotalSupply are the same and cancel out.
     const marketCapInWei = (reserveWETH * tokenTotalSupply) / reserveToken;
 
     return { pairAddress, price: formatEther(priceInWei), marketCap: formatEther(marketCapInWei) };
-    // ========== BUG FIX ENDS HERE ==========
 }
 
 async function getTxOptions(value = 0n) {
@@ -173,7 +161,7 @@ async function zapInConversation(conversation, ctx) {
     const tokenAddress = getAddress(tokenAddressText);
 
     const waitingMessage = await ctx.reply("🔍 Fetching token info and estimating base gas cost...");
-    let tokenInfo, pairInfo, estimatedGasCost;
+    let tokenInfo, pairInfo, estimatedTotalFee, gasPriceInGwei;
 
     try {
         const [
@@ -191,22 +179,34 @@ async function zapInConversation(conversation, ctx) {
         tokenInfo = localTokenInfo;
         pairInfo = localPairInfo;
 
+        // ========== GWEI DISPLAY CHANGE STARTS HERE ==========
         const gasPrice = feeData.gasPrice || feeData.maxFeePerGas;
-        estimatedGasCost = formatEther(gasEstimate * gasPrice);
+
+        // Calculate the current gas price in Gwei for display
+        gasPriceInGwei = parseFloat(formatUnits(gasPrice, "gwei")).toFixed(2);
+
+        // Calculate the total estimated fee in ETH for display
+        estimatedTotalFee = formatEther(gasEstimate * gasPrice);
+        // ========== GWEI DISPLAY CHANGE ENDS HERE ==========
+
     } catch (e) {
         log("error", "Error during zap-in pre-flight checks:", e);
         await ctx.api.editMessageText(ctx.chat.id, waitingMessage.message_id, `❌ Error fetching token data: ${e.reason || e.message}`);
         return;
     }
 
+    // ========== GWEI DISPLAY CHANGE STARTS HERE ==========
+    // Updated the text to show both Gwei price and the total fee in ETH
     const infoText = `
 *Token Found:*
 *Name:* ${tokenInfo.name} (${tokenInfo.symbol})
 *Address:* \`${tokenAddress}\`
 *Market Cap:* ~${parseFloat(pairInfo.marketCap).toFixed(2)} ETH
-*Est. Gas Fee:* ~${parseFloat(estimatedGasCost).toFixed(5)} ETH
+*Current Gas Price:* ~${gasPriceInGwei} Gwei
+*Est. Total Fee:* ~${parseFloat(estimatedTotalFee).toFixed(5)} ETH
 
 How much ETH would you like to zap in? (e.g., '0.05')`;
+    // ========== GWEI DISPLAY CHANGE ENDS HERE ==========
     await ctx.api.editMessageText(ctx.chat.id, waitingMessage.message_id, infoText, { parse_mode: "Markdown" });
 
     const ethAmountMsg = await conversation.wait();

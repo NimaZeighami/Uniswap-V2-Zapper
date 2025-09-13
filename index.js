@@ -15,7 +15,7 @@ import {
 } from 'ethers';
 import fs from 'fs/promises';
 
-// =================================================================
+// = an================================================================
 // --- SETUP, CONFIGURATION & CONSTANTS ---
 // =================================================================
 
@@ -39,7 +39,7 @@ const POSITIONS_FILE_PATH = './positions.json';
 
 // --- Transaction Parameters ---
 const SLIPPAGE_BPS = 2000; // 20% slippage tolerance
-const DEADLINE_MINUTES = 2; // 20 minutes for transactions to succeed
+const DEADLINE_MINUTES = 3; // 3 minutes for transactions to succeed
 const GAS_BUMP_GWEI = 0n; // Add 1 Gwei to the priority fee to speed up transactions. Set to 0n to disable.
 
 // --- ABIs (Application Binary Interfaces) ---
@@ -150,76 +150,33 @@ async function getTxOptions(value = 0n) {
 // =================================================================
 
 async function zapInConversation(conversation, ctx) {
-    conversation.session = conversation.session || {};
-    let tokenAddress;
-    const { initialTokenAddress } = conversation.session;
+    await ctx.reply("Please provide the token contract address to pair with ETH.");
+    const tokenAddressMsg = await conversation.wait();
+    const tokenAddressText = tokenAddressMsg.message?.text;
 
-    if (initialTokenAddress && isAddress(initialTokenAddress)) {
-        tokenAddress = getAddress(initialTokenAddress);
-        await ctx.reply(`Starting zap in process for token: \`${tokenAddress}\``, { parse_mode: 'Markdown' });
-    } else {
-        await ctx.reply("Please provide the token contract address to pair with ETH.");
-        const tokenAddressMsg = await conversation.wait();
-        const tokenAddressText = tokenAddressMsg.message?.text;
-
-        if (!tokenAddressText || !isAddress(tokenAddressText)) {
-            await ctx.reply("❌ Invalid Ethereum address. Please start again.");
-            return;
-        }
-        tokenAddress = getAddress(tokenAddressText);
-    }
-
-    const waitingMessage = await ctx.reply("🔍 Fetching token info and estimating base gas cost...");
-    let tokenInfo, pairInfo, estimatedTotalFee, gasPriceInGwei;
-
-    try {
-        const [
-            localTokenInfo,
-            localPairInfo,
-            gasEstimate,
-            feeData
-        ] = await Promise.all([
-            getTokenInfo(tokenAddress),
-            getPairInfo(tokenAddress),
-            zapperContract.zapInETH.estimateGas(tokenAddress, 0n, 0n, wallet.address, Math.floor(Date.now() / 1000) + 120, SLIPPAGE_BPS, { value: parseEther('0.0001') }),
-            provider.getFeeData()
-        ]);
-
-        tokenInfo = localTokenInfo;
-        pairInfo = localPairInfo;
-        const gasPrice = feeData.gasPrice || feeData.maxFeePerGas;
-        gasPriceInGwei = parseFloat(formatUnits(gasPrice, "gwei")).toFixed(2);
-        estimatedTotalFee = formatEther(gasEstimate * gasPrice);
-
-    } catch (e) {
-        log("error", "Error during zap-in pre-flight checks:", e);
-        await ctx.api.editMessageText(ctx.chat.id, waitingMessage.message_id, `❌ Error fetching token data: ${e.reason || e.message}`);
+    if (!tokenAddressText || !isAddress(tokenAddressText)) {
+        await ctx.reply("❌ Invalid Ethereum address. Please start again.");
         return;
     }
+    const tokenAddress = getAddress(tokenAddressText);
 
-    const infoText = `
-*Token Found:*
-*Name:* ${tokenInfo.name} (${tokenInfo.symbol})
-*Address:* \`${tokenAddress}\`
-*Market Cap:* ~${parseFloat(pairInfo.marketCap).toFixed(2)} ETH
-*Current Gas Price:* ~${gasPriceInGwei} Gwei
-*Est. Total Fee:* ~${parseFloat(estimatedTotalFee).toFixed(5)} ETH
-
-How much ETH would you like to zap in?`;
-
-    const amountKeyboard = new InlineKeyboard()
-        .text("0.001", "zap_amount:0.001").text("0.003", "zap_amount:0.003").row()
-        .text("0.005", "zap_amount:0.005").text("0.008", "zap_amount:0.008");
-
-    await ctx.api.editMessageText(ctx.chat.id, waitingMessage.message_id, infoText, { parse_mode: "Markdown", reply_markup: amountKeyboard });
+    // Start the zap in flow with combined token info and amount selection
+    await displayZapInTokenInfo(ctx, tokenAddress);
 
     const response = await conversation.waitFor(["message:text", "callback_query"]);
     let ethAmount;
 
     if (response.callbackQuery) {
-        ethAmount = response.callbackQuery.data.split(':')[1];
-        await response.answerCallbackQuery();
-        await response.editMessageText(`Selected ${ethAmount} ETH.`, { reply_markup: undefined });
+        if (response.callbackQuery.data.startsWith('zap_amount:')) {
+            ethAmount = response.callbackQuery.data.split(':')[1];
+            await response.answerCallbackQuery();
+            await response.editMessageText(`Selected ${ethAmount} ETH. Proceeding with zap in...`, { reply_markup: undefined });
+        } else if (response.callbackQuery.data.startsWith('refresh_zap:')) {
+            await response.answerCallbackQuery({ text: 'Refreshing...' });
+            await displayZapInTokenInfo(ctx, tokenAddress, true);
+            // End the conversation after refresh to prevent further operations
+            return;
+        }
     } else {
         ethAmount = response.message?.text;
     }
@@ -229,10 +186,17 @@ How much ETH would you like to zap in?`;
         return;
     }
 
+    // Stop the watcher before proceeding with zap in
+    stopWatcher(ctx.chat.id);
+
     await ctx.reply(`🚀 Zapping ${ethAmount} ETH... Please wait for blockchain confirmation.`);
     const amountIn = parseEther(ethAmount);
 
     try {
+        const [pairInfo] = await Promise.all([
+            getPairInfo(tokenAddress)
+        ]);
+
         const deadline = Math.floor(Date.now() / 1000) + (DEADLINE_MINUTES * 60);
         const txOptions = await getTxOptions(amountIn);
         const tx = await zapperContract.zapInETH(tokenAddress, 0n, 0n, wallet.address, deadline, SLIPPAGE_BPS, txOptions);
@@ -241,6 +205,7 @@ How much ETH would you like to zap in?`;
         await ctx.reply(`Transaction submitted! View on Etherscan: https://etherscan.io/tx/${tx.hash}`);
 
         await tx.wait();
+        const tokenInfo = await getTokenInfo(tokenAddress);
         log("info", `Zap-in transaction confirmed for ${ethAmount} ETH with ${tokenInfo.symbol}.`);
 
         const positions = await loadPositions();
@@ -249,19 +214,15 @@ How much ETH would you like to zap in?`;
         if (existingPositionIndex > -1) {
             log("info", `Updating existing position for ${tokenInfo.symbol}`);
             const existingPosition = positions[existingPositionIndex];
-
             const oldEth = parseFloat(existingPosition.initialEthValue);
             const newEth = parseFloat(ethAmount);
             const oldMCap = parseFloat(existingPosition.initialMarketCap);
             const newMCap = parseFloat(pairInfo.marketCap);
-
             const totalEth = oldEth + newEth;
             const weightedMCap = ((oldMCap * oldEth) + (newMCap * newEth)) / totalEth;
-
             existingPosition.initialEthValue = totalEth.toString();
             existingPosition.initialMarketCap = weightedMCap.toString();
             existingPosition.timestamp = Date.now();
-
         } else {
             log("info", `Creating new position for ${tokenInfo.symbol}`);
             positions.push({
@@ -273,7 +234,6 @@ How much ETH would you like to zap in?`;
             });
         }
         await savePositions(positions);
-
         await ctx.reply(`✅ Zap In successful! Your position has been created/updated.`);
     } catch (e) {
         log("error", "Zap In execution error:", e);
@@ -286,13 +246,13 @@ How much ETH would you like to zap in?`;
 // --- TELEGRAM BOT SETUP & MIDDLEWARE ---
 // =================================================================
 
-const activePositionWatchers = new Map();
+const activeWatchers = new Map();
 
 function stopWatcher(chatId) {
-    if (activePositionWatchers.has(chatId)) {
-        clearInterval(activePositionWatchers.get(chatId).intervalId);
-        activePositionWatchers.delete(chatId);
-        log('info', `Stopped position watcher for chat ID: ${chatId}`);
+    if (activeWatchers.has(chatId)) {
+        clearInterval(activeWatchers.get(chatId).intervalId);
+        activeWatchers.delete(chatId);
+        log('info', `Stopped watcher for chat ID: ${chatId}`);
     }
 }
 
@@ -308,13 +268,14 @@ bot.use(createConversation(zapInConversation));
 
 bot.command("start", (ctx) => {
     stopWatcher(ctx.chat.id);
-    ctx.reply("Welcome to the Uniswap V2 Zapper Bot!\n\n/zapin - Manual zap in process\n/positions - View and manage your open positions\n");
+    ctx.reply("Welcome to the Uniswap V2 Zapper Bot!\n\n/zapin - Add liquidity to a pool (includes token monitoring).\n/positions - View and manage your open positions.");
 });
 
 bot.command("zapin", async (ctx) => {
     stopWatcher(ctx.chat.id);
     await ctx.conversation.enter("zapInConversation");
 });
+
 
 bot.command("positions", async (ctx) => {
     stopWatcher(ctx.chat.id);
@@ -331,6 +292,24 @@ bot.command("positions", async (ctx) => {
 // =================================================================
 // --- CALLBACK QUERY (BUTTON) HANDLERS ---
 // =================================================================
+
+bot.callbackQuery(/^refresh_watch:(.+)$/, async (ctx) => {
+    const tokenAddress = ctx.match[1];
+    await ctx.answerCallbackQuery({ text: 'Refreshing...' });
+    await displayTokenWatch(ctx, tokenAddress, true);
+});
+
+bot.callbackQuery(/^zap_amount:(.+)$/, async (ctx) => {
+    const amount = ctx.match[1];
+    await ctx.answerCallbackQuery({ text: `Selected ${amount} ETH` });
+    await ctx.editMessageText(`Selected ${amount} ETH. Proceeding with zap in...`, { reply_markup: undefined });
+});
+
+bot.callbackQuery(/^refresh_zap:(.+)$/, async (ctx) => {
+    const tokenAddress = ctx.match[1];
+    await ctx.answerCallbackQuery({ text: 'Refreshing...' });
+    await displayZapInTokenInfo(ctx, tokenAddress, true);
+});
 
 bot.callbackQuery(/^(prev_pos|next_pos)$/, async (ctx) => {
     const positions = await loadPositions();
@@ -409,10 +388,188 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
     }
 });
 
-
 // =================================================================
 // --- DISPLAY LOGIC ---
 // =================================================================
+
+async function generateTokenWatchMessage(tokenAddress) {
+    const [tokenInfo, pairInfo] = await Promise.all([
+        getTokenInfo(tokenAddress),
+        getPairInfo(tokenAddress),
+    ]);
+
+    const mcap = parseFloat(pairInfo.marketCap);
+    const price = parseFloat(pairInfo.price);
+
+    const messageText = `
+*Watching Token:* ${tokenInfo.name} (${tokenInfo.symbol})
+*Address:* \`${tokenAddress}\`
+
+*Market Cap:* \`${mcap.toFixed(2)} ETH\`
+*Price:* \`${price.toFixed(8)} ETH\`
+
+_(Last Updated: ${new Date().toLocaleTimeString()})_`;
+
+    const keyboard = new InlineKeyboard()
+        .text('🔄 Refresh', `refresh_watch:${tokenAddress}`);
+
+    return { messageText, keyboard };
+}
+
+async function generateZapInTokenMessage(tokenAddress) {
+    const [tokenInfo, pairInfo] = await Promise.all([
+        getTokenInfo(tokenAddress),
+        getPairInfo(tokenAddress),
+    ]);
+
+    const mcap = parseFloat(pairInfo.marketCap);
+    const price = parseFloat(pairInfo.price);
+
+    const messageText = `
+*Token Found:*
+*Name:* ${tokenInfo.name} (${tokenInfo.symbol})
+*Address:* \`${tokenAddress}\`
+*Market Cap:* ~${mcap.toFixed(2)} ETH
+*Price:* ~${price.toFixed(8)} ETH
+
+How much ETH would you like to zap in?
+
+_(Last Updated: ${new Date().toLocaleTimeString()})_`;
+
+    const keyboard = new InlineKeyboard()
+        .text("0.001", "zap_amount:0.001").text("0.003", "zap_amount:0.003").row()
+        .text("0.005", "zap_amount:0.005").text("0.008", "zap_amount:0.008").row()
+        .text('🔄 Refresh', `refresh_zap:${tokenAddress}`);
+
+    return { messageText, keyboard };
+}
+
+
+async function displayZapInTokenInfo(ctx, tokenAddress, edit = false) {
+    const chatId = ctx.chat.id;
+    stopWatcher(chatId); // Stop any previous watchers for this chat
+
+    let sentMessage;
+    try {
+        let waitMessage;
+        if (edit) {
+            try {
+                waitMessage = await ctx.editMessageText('⏳ Fetching token data...');
+            } catch (e) {
+                // If editing fails, send a new message
+                waitMessage = await ctx.reply('⏳ Fetching token data...');
+                edit = false;
+            }
+        } else {
+            waitMessage = await ctx.reply('⏳ Fetching token data...');
+        }
+
+        const { messageText, keyboard } = await generateZapInTokenMessage(tokenAddress);
+
+        try {
+            if (edit) {
+                sentMessage = await ctx.api.editMessageText(chatId, waitMessage.message_id, messageText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard,
+                });
+            } else {
+                sentMessage = await ctx.api.editMessageText(chatId, waitMessage.message_id, messageText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard,
+                });
+            }
+        } catch (e) {
+            // If editing fails, send as new message
+            sentMessage = await ctx.reply(messageText, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard,
+            });
+        }
+
+        const intervalId = setInterval(async () => {
+            try {
+                const { messageText, keyboard } = await generateZapInTokenMessage(tokenAddress);
+                await ctx.api.editMessageText(chatId, sentMessage.message_id, messageText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard,
+                }).catch(e => {
+                    if (e?.description?.includes("message is not modified")) {
+                        // Ignore, data is the same
+                    } else {
+                        throw e;
+                    }
+                });
+            } catch (error) {
+                log('error', `Auto-refresh failed for zap in on ${tokenAddress} in chat ${chatId}:`, error);
+                if (error instanceof GrammyError && error.description?.includes("message to edit not found")) {
+                    stopWatcher(chatId); // Stop if the message was deleted
+                }
+                // Don't stop for RPC errors, it might be temporary
+            }
+        }, 30000); // Refresh every 30 seconds
+
+        activeWatchers.set(chatId, { intervalId });
+
+    } catch (e) {
+        log("error", "Display Zap In Token Info Error:", e);
+        const errorMessage = `❌ Could not load token data: ${e.message}`;
+        if (sentMessage) await ctx.api.editMessageText(chatId, sentMessage.message_id, errorMessage);
+        else if (edit) await ctx.editMessageText(errorMessage);
+        else await ctx.reply(errorMessage);
+    }
+}
+
+async function displayTokenWatch(ctx, tokenAddress, edit = false) {
+    const chatId = ctx.chat.id;
+    stopWatcher(chatId); // Stop any previous watchers for this chat
+
+    let sentMessage;
+    try {
+        const waitMessage = edit
+            ? await ctx.editMessageText('⏳ Fetching token data...')
+            : await ctx.reply('⏳ Fetching token data...');
+
+        const { messageText, keyboard } = await generateTokenWatchMessage(tokenAddress);
+
+        sentMessage = await ctx.api.editMessageText(chatId, waitMessage.message_id, messageText, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard,
+        });
+
+        const bot = ctx.api;
+        const intervalId = setInterval(async () => {
+            try {
+                const { messageText, keyboard } = await generateTokenWatchMessage(tokenAddress);
+                await bot.editMessageText(chatId, sentMessage.message_id, messageText, {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard,
+                }).catch(e => {
+                    if (e?.description?.includes("message is not modified")) {
+                        // Ignore, data is the same
+                    } else {
+                        throw e;
+                    }
+                });
+            } catch (error) {
+                log('error', `Auto-refresh failed for watch on ${tokenAddress} in chat ${chatId}:`, error);
+                if (error instanceof GrammyError && error.description?.includes("message to edit not found")) {
+                    stopWatcher(chatId); // Stop if the message was deleted
+                }
+                // Don't stop for RPC errors, it might be temporary
+            }
+        }, 30000); // Refresh every 30 seconds
+
+        activeWatchers.set(chatId, { intervalId });
+
+    } catch (e) {
+        log("error", "Display Watch Error:", e);
+        const errorMessage = `❌ Could not load token data: ${e.message}`;
+        if (sentMessage) await ctx.api.editMessageText(chatId, sentMessage.message_id, errorMessage);
+        else if (edit) await ctx.editMessageText(errorMessage);
+        else await ctx.reply(errorMessage);
+    }
+}
+
 
 async function generatePositionMessage(position, totalPositions, currentIndex) {
     const pairContract = new Contract(position.pairAddress, UNISWAP_V2_PAIR_ABI, provider);
@@ -449,10 +606,6 @@ async function generatePositionMessage(position, totalPositions, currentIndex) {
 
     const userSharePercent = Number((lpBalance * 10000n) / pairTotalSupply) / 100;
 
-//     --- * Performance * ---
-// * Initial ETH Value:* ${ initialValueEth.toFixed(5) } ETH
-//         * Current LP Value:* ~${ userLpValueEth.toFixed(5) } ETH
-//             * LP Value P / L:* * ${ lpProfitSign }${ lpProfitPercent.toFixed(2) }%*
     const messageText = `
 *Position ${currentIndex + 1} of ${totalPositions}*
 *Token:* ${tokenInfo.name} (${tokenInfo.symbol})
@@ -460,8 +613,6 @@ async function generatePositionMessage(position, totalPositions, currentIndex) {
 
 *Your LP Balance:* \`${formatEther(lpBalance)}\` LP
 *Your Pool Share:* ~${userSharePercent.toFixed(4)}%
-
-
 
 *Initial MCAP:* ~${initialMarketCap.toFixed(2)} ETH
 *Current MCAP:* ~${currentMarketCap.toFixed(2)} ETH
@@ -517,22 +668,28 @@ async function displayPosition(ctx, edit = false) {
                 await ctx.api.editMessageText(chatId, sentMessage.message_id, messageText, {
                     parse_mode: 'Markdown',
                     reply_markup: keyboard,
+                }).catch(e => {
+                    if (e?.description?.includes("message is not modified")) {
+                        // Ignore
+                    } else {
+                        throw e;
+                    }
                 });
             } catch (error) {
                 log('error', `Auto-refresh failed for chat ${chatId}:`, error);
-                if (error instanceof GrammyError && (error.description.includes("message to edit not found") || error.description.includes("message is not modified"))) {
+                if (error instanceof GrammyError && error.description?.includes("message to edit not found")) {
                     stopWatcher(chatId);
                 }
             }
         }, 10000);
 
-        activePositionWatchers.set(chatId, { intervalId });
+        activeWatchers.set(chatId, { intervalId });
 
     } catch (e) {
         log("error", "Display Position Error:", e);
         const errorMessage = `❌ Could not load position data: ${e.message}`;
         if (sentMessage) await ctx.api.editMessageText(chatId, sentMessage.message_id, errorMessage);
-        else if (edit) await ctx.editMessageText(errorMessage)
+        else if (edit) await ctx.editMessageText(errorMessage);
         else await ctx.reply(errorMessage);
     }
 }

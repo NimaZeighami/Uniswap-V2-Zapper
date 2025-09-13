@@ -1,1 +1,9 @@
-[]
+[
+  {
+    "tokenAddress": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "pairAddress": "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852",
+    "initialEthValue": "0.001",
+    "initialMarketCap": "18930431.272283632042105032",
+    "timestamp": 1757788456440
+  }
+]

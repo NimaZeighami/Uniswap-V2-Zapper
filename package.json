@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "A Node.js script to automate Zap In and Zap Out operation for Uniswap V2 liquidity pool.",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },

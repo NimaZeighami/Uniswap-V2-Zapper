@@ -319,19 +319,27 @@ async function zapInConversation(conversation, ctx) {
                     }
                     await savePositions(positions);
 
+                    // ==========================================================
+                    // --- MODIFIED LOGIC: DECOUPLE CONVERSATION FROM DISPLAY ---
+                    // ==========================================================
                     const finalIndex = existingPositionIndex > -1 ? existingPositionIndex : positions.length - 1;
+
+                    // The session object should be writable just before the conversation ends.
+                    // We set the index here for the next interaction.
+                    (ctx.session ?? (ctx.session = {})).positionIndex = finalIndex;
+
+                    const keyboard = new InlineKeyboard().text("✅ View Position", "show_position");
 
                     await ctx.api.editMessageText(
                         ctx.chat.id,
                         mainMessage.message_id,
-                        `✅ Zap In successful for ${tokenInfo.symbol}! Loading position view...`,
+                        `✅ Zap In successful for ${tokenInfo.symbol}!\n\nClick the button below to manage your position.`,
                         {
-                            reply_markup: undefined // Remove buttons
+                            reply_markup: keyboard,
+                            parse_mode: 'Markdown'
                         }
                     );
-
-                    // Call displayPosition with the specific index, bypassing session issues.
-                    await displayPosition(ctx, false, finalIndex);
+                    // The conversation now ends cleanly.
 
                 } catch (e) {
                     log("error", "Zap In execution error:", e);
@@ -409,6 +417,14 @@ bot.callbackQuery(/^zap_amount:(.+)$/, async (ctx) => {
     // The conversation will handle the rest
 });
 
+// New handler for the "View Position" button
+bot.callbackQuery("show_position", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    // The session should contain the correct index set by the conversation.
+    // We call displayPosition by editing the message the button is attached to.
+    await displayPosition(ctx, true);
+});
+
 bot.callbackQuery(/^(prev_pos|next_pos)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const positions = await loadPositions();
@@ -417,11 +433,13 @@ bot.callbackQuery(/^(prev_pos|next_pos)$/, async (ctx) => {
         return;
     }
     const direction = ctx.match[1];
+    let currentIndex = ctx.session?.positionIndex ?? 0;
     if (direction === 'prev_pos') {
-        ctx.session.positionIndex = (ctx.session.positionIndex - 1 + positions.length) % positions.length;
+        currentIndex = (currentIndex - 1 + positions.length) % positions.length;
     } else {
-        ctx.session.positionIndex = (ctx.session.positionIndex + 1) % positions.length;
+        currentIndex = (currentIndex + 1) % positions.length;
     }
+    (ctx.session ?? (ctx.session = {})).positionIndex = currentIndex;
     await displayPosition(ctx, true);
 });
 
@@ -435,7 +453,7 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const percentage = parseInt(ctx.match[1], 10);
     const positions = await loadPositions();
-    const positionIndex = ctx.session.positionIndex;
+    let positionIndex = ctx.session?.positionIndex ?? 0;
     const position = positions[positionIndex];
 
     if (!position) {
@@ -514,7 +532,8 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
         let newPositions = await loadPositions(); // Re-load to be safe
         if (percentage === 100) {
             newPositions.splice(positionIndex, 1);
-            ctx.session.positionIndex = Math.max(0, positionIndex - 1);
+            positionIndex = Math.max(0, positionIndex - 1);
+            (ctx.session ?? (ctx.session = {})).positionIndex = positionIndex;
         }
         await savePositions(newPositions);
         await ctx.reply(`✅ ${percentage}% Zap Out successful!`);
@@ -650,41 +669,39 @@ _(Last Updated: ${new Date().toLocaleTimeString()})_`;
 }
 
 
-async function displayPosition(ctx, edit = false, startIndex = null) {
+async function displayPosition(ctx, edit = false) {
     const chatId = ctx.chat.id;
     stopWatcher(chatId);
 
-    // If a specific starting index is provided, use it and update the session.
-    if (startIndex !== null) {
-        // Ensure session exists before setting properties on it
-        if (!ctx.session) {
-            ctx.session = { positionIndex: 0 };
-        }
-        ctx.session.positionIndex = startIndex;
-    }
-
     const positions = await loadPositions();
-    const index = ctx.session.positionIndex;
+    // Use session, which should be valid in a new interaction context.
+    const index = ctx.session?.positionIndex ?? 0;
 
 
     if (!positions[index]) {
         const message = "You have no open positions.";
-        edit ? await ctx.editMessageText(message, { reply_markup: undefined }).catch(e => log("warn", "Edit failed", e)) : await ctx.reply(message);
+        edit ? await bot.api.editMessageText(chatId, ctx.callbackQuery.message.message_id, message, { reply_markup: undefined }).catch(e => log("warn", "Edit failed", e)) : await ctx.reply(message);
         return;
     }
 
     let waitMessage;
     try {
-        waitMessage = edit
-            ? await ctx.editMessageText(`⏳ Loading position ${index + 1}/${positions.length}...`, { reply_markup: undefined })
-            : await ctx.reply(`⏳ Loading position ${index + 1}/${positions.length}...`);
+        if (edit) {
+            await bot.api.editMessageText(chatId, ctx.callbackQuery.message.message_id, `⏳ Loading position ${index + 1}/${positions.length}...`, { reply_markup: undefined });
+            waitMessage = ctx.callbackQuery.message;
+        } else {
+            waitMessage = await ctx.reply(`⏳ Loading position ${index + 1}/${positions.length}...`);
+        }
 
         const { messageText, keyboard } = await generatePositionMessage(positions[index]);
 
-        const sentMessage = await ctx.api.editMessageText(chatId, waitMessage.message_id, messageText, {
+        // Use the global bot.api object, which is not tied to a specific context
+        await bot.api.editMessageText(chatId, waitMessage.message_id, messageText, {
             parse_mode: 'Markdown',
             reply_markup: keyboard,
         });
+
+        const sentMessageId = waitMessage.message_id;
 
         const intervalId = setInterval(async () => {
             try {
@@ -696,11 +713,13 @@ async function displayPosition(ctx, edit = false, startIndex = null) {
                 const currentPosition = currentPositions[index];
                 if (!currentPosition) {
                     stopWatcher(chatId);
-                    await ctx.api.editMessageText(chatId, sentMessage.message_id, "Position has been closed.", { reply_markup: undefined }).catch(e => log("warn", "Edit failed, msg likely deleted", e));
+                    await bot.api.editMessageText(chatId, sentMessageId, "Position has been closed.", { reply_markup: undefined }).catch(e => log("warn", "Edit failed, msg likely deleted", e));
                     return;
                 }
                 const { messageText: newText, keyboard: newKeyboard } = await generatePositionMessage(currentPosition);
-                await ctx.api.editMessageText(chatId, sentMessage.message_id, newText, {
+
+                // Use the global bot.api for the refresh
+                await bot.api.editMessageText(chatId, sentMessageId, newText, {
                     parse_mode: 'Markdown',
                     reply_markup: newKeyboard,
                 }).catch(e => {
@@ -719,7 +738,7 @@ async function displayPosition(ctx, edit = false, startIndex = null) {
     } catch (e) {
         log("error", "Display Position Error:", e);
         const errorMessage = `❌ Could not load position data: ${e.message}`;
-        if (waitMessage) await ctx.api.editMessageText(chatId, waitMessage.message_id, errorMessage).catch(err => log("error", "Failed to edit to error message", err));
+        if (waitMessage) await bot.api.editMessageText(chatId, waitMessage.message_id, errorMessage).catch(err => log("error", "Failed to edit to error message", err));
         else await ctx.reply(errorMessage).catch(err => log("error", "Failed to send error message", err));
     }
 }

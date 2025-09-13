@@ -1,7 +1,8 @@
-require('dotenv').config();
-const { Bot, session, InlineKeyboard, GrammyError, HttpError } = require('grammy');
-const { conversations, createConversation } = require('@grammyjs/conversations');
-const {
+import { config } from 'dotenv';
+config();
+import { Bot, session, InlineKeyboard, GrammyError, HttpError } from 'grammy';
+import { conversations, createConversation } from '@grammyjs/conversations';
+import {
     JsonRpcProvider,
     Wallet,
     Contract,
@@ -12,8 +13,8 @@ const {
     isAddress,
     formatUnits,
     parseUnits
-} = require('ethers');
-const fs = require('fs/promises');
+} from 'ethers';
+import fs from 'fs/promises';
 
 // =================================================================
 // --- SETUP, CONFIGURATION & CONSTANTS ---
@@ -131,18 +132,25 @@ async function getPairInfo(tokenOtherAddress) {
 async function getTxOptions(value = 0n) {
     const feeData = await provider.getFeeData();
     const options = { value };
+    let effectiveGasPrice;
 
     const priorityFeeBump = parseUnits(GAS_BUMP_GWEI.toString(), "gwei");
 
     if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
         options.maxFeePerGas = feeData.maxFeePerGas;
         options.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + priorityFeeBump;
+        effectiveGasPrice = options.maxFeePerGas; // For calculation
         log("info", `EIP-1559 Tx: Prio Fee Bumped to ${formatUnits(options.maxPriorityFeePerGas, "gwei")} Gwei`);
     } else if (feeData.gasPrice) {
         options.gasPrice = feeData.gasPrice + priorityFeeBump;
+        effectiveGasPrice = options.gasPrice; // For calculation
         log("info", `Legacy Tx: Gas Price Bumped to ${formatUnits(options.gasPrice, "gwei")} Gwei`);
+    } else {
+        // Fallback if no fee data is available
+        return { gasPrice: undefined, ...options };
     }
-    return options;
+    // Return an object that matches the desired destructuring
+    return { gasPrice: effectiveGasPrice, ...options };
 }
 
 async function getEthPriceInUsd() {
@@ -167,8 +175,6 @@ async function getEthPriceInUsd() {
 // =================================================================
 // --- TELEGRAM CONVERSATIONS ---
 // =================================================================
-
-// --- REPLACE the existing zapInConversation function with this one ---
 
 async function zapInConversation(conversation, ctx) {
     activeConversations.add(ctx.chat.id);
@@ -244,17 +250,13 @@ async function zapInConversation(conversation, ctx) {
                     ethAmount = potentialAmount;
                     keepWaiting = false;
                 } else {
-                    // ==========================================================
-                    // --- THIS IS THE MODIFIED LOGIC ---
-                    // Instead of looping, we now exit the conversation.
                     await ctx.api.editMessageText(
                         ctx.chat.id,
                         mainMessage.message_id,
                         "❌ Invalid input. The zap-in process has been cancelled.\n\nYou can now use other commands like /start or /positions.",
                         { reply_markup: undefined } // Remove the keyboard
                     );
-                    return; // This is the key change: we EXIT the function.
-                    // ==========================================================
+                    return;
                 }
             }
 
@@ -272,17 +274,16 @@ async function zapInConversation(conversation, ctx) {
 
                 try {
                     const deadline = Math.floor(Date.now() / 1000) + (DEADLINE_MINUTES * 60);
-                    const txOptions = await getTxOptions(amountIn);
+                    const { gasPrice, ...txOptions } = await getTxOptions(amountIn);
 
                     const gasLimit = await zapperContract.zapInETH.estimateGas(tokenAddress, 0n, 0n, wallet.address, deadline, SLIPPAGE_BPS, txOptions);
-                    const effectiveGasPrice = txOptions.maxFeePerGas || txOptions.gasPrice;
-                    const estimatedFeeWei = gasLimit * effectiveGasPrice;
+                    const estimatedFeeWei = gasLimit * gasPrice;
                     const estimatedFeeEth = formatEther(estimatedFeeWei);
                     const ethPriceUsd = await getEthPriceInUsd();
                     const estimatedFeeUsd = parseFloat(estimatedFeeEth) * ethPriceUsd;
-                    const gasPriceGwei = formatUnits(effectiveGasPrice, "gwei");
+                    const gasPriceGwei = formatUnits(gasPrice, "gwei");
 
-                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `🚀 Zapping ${ethAmount} ETH... Please wait for blockchain confirmation.\n\n*Estimated Fee Details:*\nGas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei\nTransaction Fee: ~$${estimatedFeeUsd.toFixed(2)}`, {
+                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `🚀 Zapping ${ethAmount} ETH... Please wait for blockchain confirmation.\n\n*Final Estimated Fee:*\nGas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei\nTransaction Fee: ~$${estimatedFeeUsd.toFixed(2)}`, {
                         parse_mode: 'Markdown',
                         reply_markup: undefined
                     }).catch(e => log("warn", "Could not edit message before zapping in:", e));
@@ -452,8 +453,52 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
         log("info", "Approval successful.");
 
         const deadline = Math.floor(Date.now() / 1000) + (DEADLINE_MINUTES * 60);
-        const txOptions = await getTxOptions();
-        const zapOutTx = await zapperContract.zapOut(WETH_ADDRESS, position.tokenAddress, liquidityToZap, WETH_ADDRESS, 0n, 0n, 0n, wallet.address, deadline, SLIPPAGE_BPS, txOptions);
+        const { gasPrice, ...txOptions } = await getTxOptions();
+
+        if (!gasPrice) {
+            throw new Error("Could not retrieve gas price for transaction.");
+        }
+
+        // Get gas price information
+        const gasEstimate = await zapperContract.zapOut.estimateGas(
+            WETH_ADDRESS,
+            position.tokenAddress,
+            liquidityToZap,
+            WETH_ADDRESS,
+            0n, 0n, 0n,
+            wallet.address,
+            deadline,
+            SLIPPAGE_BPS,
+            txOptions
+        );
+
+        // Calculate estimated transaction fee
+        const estimatedFeeWei = gasEstimate * gasPrice;
+        const estimatedFeeEth = formatEther(estimatedFeeWei);
+        const ethPriceUsd = await getEthPriceInUsd();
+        const estimatedFeeUsd = parseFloat(estimatedFeeEth) * ethPriceUsd;
+
+        // Show gas information to user
+        await ctx.editMessageText(
+            `⏳ Executing ${percentage}% Zap Out...\n\n` +
+            `*Estimated Fee Details:*\n` +
+            `Gas Price: ~${parseFloat(formatUnits(gasPrice, "gwei")).toFixed(2)} Gwei\n` +
+            `Est. Transaction Fee: ~$${estimatedFeeUsd.toFixed(2)}`,
+            { parse_mode: 'Markdown' }
+        );
+
+        // Execute the transaction
+        const zapOutTx = await zapperContract.zapOut(
+            WETH_ADDRESS,
+            position.tokenAddress,
+            liquidityToZap,
+            WETH_ADDRESS,
+            0n, 0n, 0n,
+            wallet.address,
+            deadline,
+            SLIPPAGE_BPS,
+            txOptions
+        );
 
         log("info", `Zap-out transaction submitted: ${zapOutTx.hash}`);
         await ctx.reply(`Transaction submitted! View on Etherscan: https://etherscan.io/tx/${zapOutTx.hash}`);
@@ -471,7 +516,7 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
 
         // Check if there are any positions left to display
         if (newPositions.length > 0) {
-            await displayPosition(ctx, true); // Re-display by EDITING the message
+            await displayPosition(ctx, true);
         } else {
             await ctx.editMessageText("All positions have been closed.", { reply_markup: undefined });
         }
@@ -488,23 +533,36 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
 // =================================================================
 
 async function generateZapInTokenMessage(tokenAddress) {
-    const [tokenInfo, pairInfo, ethPriceUsd] = await Promise.all([
+    const [tokenInfo, pairInfo, ethPriceUsd, feeData] = await Promise.all([
         getTokenInfo(tokenAddress),
         getPairInfo(tokenAddress),
-        getEthPriceInUsd()
+        getEthPriceInUsd(),
+        provider.getFeeData()
     ]);
+
+    // --- Calculate a GENERAL gas fee estimate ---
+    const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || parseUnits("10", "gwei"); // Use maxFeePerGas for EIP-1559, fallback to gasPrice, then to a default
+    const gasPriceGwei = formatUnits(gasPrice, "gwei");
+    const ESTIMATED_ZAPIN_GAS_LIMIT = 200000n; // A conservative gas limit for a typical zap-in
+    const estimatedFeeWei = ESTIMATED_ZAPIN_GAS_LIMIT * gasPrice;
+    const estimatedFeeEth = parseFloat(formatEther(estimatedFeeWei));
+    const estimatedFeeUsd = estimatedFeeEth * ethPriceUsd;
+    // --- End of fee calculation ---
 
     const mcapEth = parseFloat(pairInfo.marketCap);
     const mcapUsd = mcapEth * ethPriceUsd;
     const priceEth = parseFloat(pairInfo.price);
-    const priceUsd = priceEth * ethPriceUsd;
+    const priceUsdString = (priceEth * ethPriceUsd).toPrecision(6);
 
-    const messageText = `
-*Token Found:*
+    const messageText = `*Token Found:*
 *Name:* ${tokenInfo.name} (${tokenInfo.symbol})
 *Address:* \`${tokenAddress}\`
 *Market Cap:* ~$${mcapUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-*Price:* ~$${priceEth.toFixed(8)}
+*Price:* ~$${priceUsdString} / ${priceEth.toFixed(12)} ETH
+
+*Current Network Estimate:*
+Gas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei
+Est. Tx Fee: ~$${estimatedFeeUsd.toFixed(2)}
 
 How much ETH would you like to zap in?
 
@@ -531,37 +589,39 @@ async function generatePositionMessage(position) {
 
     if (pairTotalSupply === 0n) throw new Error("Could not calculate value: Pool has no liquidity.");
 
+    // Correctly get WETH reserve regardless of token0/token1 order
     const token0 = await pairContract.token0();
-    const [reserveWETH, reserveToken] = getAddress(token0) === getAddress(WETH_ADDRESS)
+    const [reserveWETH,] = getAddress(token0) === getAddress(WETH_ADDRESS)
         ? [reserves[0], reserves[1]] : [reserves[1], reserves[0]];
 
-    if (reserveToken === 0n) throw new Error("Could not calculate value: Token has no reserves.");
-
     const userShareOfWETH = (reserveWETH * lpBalance) / pairTotalSupply;
-    const userShareOfToken = (reserveToken * lpBalance) / pairTotalSupply;
-    const valueOfTokenInWETH = (userShareOfToken * reserveWETH) / reserveToken;
-    const userLpValueWei = userShareOfWETH + valueOfTokenInWETH;
-
+    const userLpValueWei = userShareOfWETH * 2n; // Total value is twice the WETH side
     const userLpValueEth = parseFloat(formatEther(userLpValueWei));
-    const initialValueEth = parseFloat(position.initialEthValue);
-    const lpProfitPercent = initialValueEth > 0 ? ((userLpValueEth - initialValueEth) / initialValueEth) * 100 : 0;
+    const userLpValueUsd = userLpValueEth * ethPriceUsd;
 
     const initialMarketCapEth = parseFloat(position.initialMarketCap);
     const currentMarketCapEth = parseFloat(currentPairInfo.marketCap);
 
-    const initialMarketCapUsd = initialMarketCapEth * ethPriceUsd;
+    const initialMarketCapUsd = initialMarketCapEth > 0 ? initialMarketCapEth * (userLpValueUsd / userLpValueEth) : 0;
     const currentMarketCapUsd = currentMarketCapEth * ethPriceUsd;
 
     const mcapProfitPercent = initialMarketCapEth > 0 ? ((currentMarketCapEth - initialMarketCapEth) / initialMarketCapEth) * 100 : 0;
     const userSharePercent = Number((lpBalance * 10000n) / pairTotalSupply) / 100;
 
+    // Get gas price for display
+    const feeData = await provider.getFeeData();
+    const gasPrice = feeData.gasPrice || feeData.maxFeePerGas || parseUnits("10", "gwei"); // Fallback
+    const gasPriceGwei = formatUnits(gasPrice, "gwei");
+    const estimatedGasLimit = 300000n; // Conservative estimate for zap out
+    const estimatedFeeWei = estimatedGasLimit * gasPrice;
+    const estimatedFeeEth = parseFloat(formatEther(estimatedFeeWei));
+    const estimatedFeeUsd = estimatedFeeEth * ethPriceUsd;
+
     // Formatting for display
     const formatUsd = (val) => val.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 });
 
-
-    const messageText = `
-*${tokenInfo.name} (${tokenInfo.symbol})*
-Position Value: ${userLpValueEth.toFixed(4)} ETH
+    const messageText = `*${tokenInfo.name} (${tokenInfo.symbol})*
+Position Value: ${userLpValueEth.toFixed(4)} ETH (~$${userLpValueUsd.toFixed(2)})
 *Address:* \`${position.tokenAddress}\`
 
 Initial MarketCap: ~${formatUsd(initialMarketCapUsd)}
@@ -569,6 +629,10 @@ Current MarketCap: ~${formatUsd(currentMarketCapUsd)}
 Token MCAP P/L: ${mcapProfitPercent >= 0 ? '📈 +' : '📉 '}${mcapProfitPercent.toFixed(2)}%
 
 Pool Share: ${userSharePercent.toFixed(4)}%
+
+*Est. Zap Out Details:*
+Gas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei
+Est. Tx Fee: ~$${estimatedFeeUsd.toFixed(2)}
 
 _(Last Updated: ${new Date().toLocaleTimeString()})_`;
 
@@ -579,6 +643,7 @@ _(Last Updated: ${new Date().toLocaleTimeString()})_`;
 
     return { messageText, keyboard };
 }
+
 
 async function displayPosition(ctx, edit = false) {
     const chatId = ctx.chat.id;
@@ -678,4 +743,3 @@ async function startBot() {
 }
 
 startBot();
-

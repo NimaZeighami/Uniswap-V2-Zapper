@@ -185,7 +185,6 @@ async function zapInConversation(conversation, ctx) {
         const tokenAddressMsg = await conversation.wait();
         const tokenAddressText = tokenAddressMsg.message?.text;
 
-        // Attempt to delete the user's message for a cleaner interface
         try {
             await ctx.api.deleteMessage(ctx.chat.id, tokenAddressMsg.message.message_id);
         } catch (e) {
@@ -198,7 +197,6 @@ async function zapInConversation(conversation, ctx) {
         }
         const tokenAddress = getAddress(tokenAddressText);
 
-        // Edit the message to show loading state, starting the interactive part
         await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, '⏳ Fetching token data...');
 
         try {
@@ -212,7 +210,6 @@ async function zapInConversation(conversation, ctx) {
             await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `❌ Could not load token data: ${e.message}`);
             return;
         }
-
 
         let keepWaiting = true;
         while (keepWaiting) {
@@ -235,11 +232,10 @@ async function zapInConversation(conversation, ctx) {
                     } catch (e) {
                         log('error', "Error refreshing zap-in info", e);
                     }
-                    continue; // Continue waiting for an amount
+                    continue;
                 }
             } else {
                 const potentialAmount = response.message?.text;
-                // Attempt to delete user's amount message
                 try {
                     await ctx.api.deleteMessage(ctx.chat.id, response.message.message_id);
                 } catch (e) {
@@ -254,13 +250,12 @@ async function zapInConversation(conversation, ctx) {
                         ctx.chat.id,
                         mainMessage.message_id,
                         "❌ Invalid input. The zap-in process has been cancelled.\n\nYou can now use other commands like /start or /positions.",
-                        { reply_markup: undefined } // Remove the keyboard
+                        { reply_markup: undefined }
                     );
                     return;
                 }
             }
 
-            // This block executes once a valid amount is received
             if (!keepWaiting) {
                 if (!ethAmount || isNaN(parseFloat(ethAmount)) || parseFloat(ethAmount) <= 0) {
                     await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, "❌ Invalid amount. Please start again with /zapin.");
@@ -275,7 +270,6 @@ async function zapInConversation(conversation, ctx) {
                 try {
                     const deadline = Math.floor(Date.now() / 1000) + (DEADLINE_MINUTES * 60);
                     const { gasPrice, ...txOptions } = await getTxOptions(amountIn);
-
                     const gasLimit = await zapperContract.zapInETH.estimateGas(tokenAddress, 0n, 0n, wallet.address, deadline, SLIPPAGE_BPS, txOptions);
                     const estimatedFeeWei = gasLimit * gasPrice;
                     const estimatedFeeEth = formatEther(estimatedFeeWei);
@@ -291,7 +285,7 @@ async function zapInConversation(conversation, ctx) {
                     const tx = await zapperContract.zapInETH(tokenAddress, 0n, 0n, wallet.address, deadline, SLIPPAGE_BPS, txOptions);
 
                     log("info", `Zap-in transaction submitted: ${tx.hash}`);
-                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `Transaction submitted! Waiting for confirmation...\n\nView on Etherscan: https://etherscan.io/tx/${tx.hash}`);
+                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `Transaction submitted! Waiting for confirmation...\n\n[View on Etherscan](https://etherscan.io/tx/${tx.hash})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
 
                     await tx.wait();
 
@@ -324,7 +318,20 @@ async function zapInConversation(conversation, ctx) {
                         });
                     }
                     await savePositions(positions);
-                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `✅ Zap In successful! Your position for ${tokenInfo.symbol} has been created/updated.\n\n[View Transaction on Etherscan](https://etherscan.io/tx/${tx.hash})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+
+                    const finalIndex = existingPositionIndex > -1 ? existingPositionIndex : positions.length - 1;
+
+                    await ctx.api.editMessageText(
+                        ctx.chat.id,
+                        mainMessage.message_id,
+                        `✅ Zap In successful for ${tokenInfo.symbol}! Loading position view...`,
+                        {
+                            reply_markup: undefined // Remove buttons
+                        }
+                    );
+
+                    // Call displayPosition with the specific index, bypassing session issues.
+                    await displayPosition(ctx, false, finalIndex);
 
                 } catch (e) {
                     log("error", "Zap In execution error:", e);
@@ -333,15 +340,13 @@ async function zapInConversation(conversation, ctx) {
                 }
                 break;
             }
-
         }
     } catch (e) {
         log('error', "Error in zapInConversation", e);
         if (mainMessage) {
             await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, "An unexpected error occurred. The conversation has been cancelled.").catch(err => log('error', 'Failed to send final error message.', err));
         }
-    }
-    finally {
+    } finally {
         activeConversations.delete(ctx.chat.id);
     }
 }
@@ -645,12 +650,22 @@ _(Last Updated: ${new Date().toLocaleTimeString()})_`;
 }
 
 
-async function displayPosition(ctx, edit = false) {
+async function displayPosition(ctx, edit = false, startIndex = null) {
     const chatId = ctx.chat.id;
     stopWatcher(chatId);
 
+    // If a specific starting index is provided, use it and update the session.
+    if (startIndex !== null) {
+        // Ensure session exists before setting properties on it
+        if (!ctx.session) {
+            ctx.session = { positionIndex: 0 };
+        }
+        ctx.session.positionIndex = startIndex;
+    }
+
     const positions = await loadPositions();
     const index = ctx.session.positionIndex;
+
 
     if (!positions[index]) {
         const message = "You have no open positions.";

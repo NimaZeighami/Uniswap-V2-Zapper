@@ -41,7 +41,7 @@ const POSITIONS_FILE_PATH = './positions.json';
 // --- Transaction Parameters ---
 const SLIPPAGE_BPS = 2000; // 20% slippage tolerance
 const DEADLINE_MINUTES = 3; // 3 minutes for transactions to succeed
-const GAS_BUMP_GWEI = 0n; // Add 0 Gwei to the priority fee. Set higher to speed up transactions.
+const BUMP_PERCENT = 20n; // 20% dynamic bump for faster transactions
 
 // --- ABIs (Application Binary Interfaces) ---
 const ZAPPER_ABI = [
@@ -109,12 +109,14 @@ async function getPairInfo(tokenOtherAddress) {
     const pairContract = new Contract(pairAddress, UNISWAP_V2_PAIR_ABI, provider);
     const tokenOtherContract = new Contract(tokenOtherAddress, ERC20_ABI, provider);
 
-    const [reserves, token0, tokenTotalSupply, tokenDecimals] = await Promise.all([
+    const [reserves, token0, tokenTotalSupply, tokenDecimalsNum] = await Promise.all([
         pairContract.getReserves(),
         pairContract.token0(),
         tokenOtherContract.totalSupply(),
-        tokenOtherContract.decimals().catch(() => 18n)
+        tokenOtherContract.decimals().catch(() => 18)
     ]);
+
+    const tokenDecimals = BigInt(tokenDecimalsNum);
 
     const [reserveWETH, reserveToken] = getAddress(token0) === getAddress(WETH_ADDRESS)
         ? [reserves[0], reserves[1]] : [reserves[1], reserves[0]];
@@ -123,7 +125,7 @@ async function getPairInfo(tokenOtherAddress) {
         return { pairAddress, price: '0', marketCap: '0' };
     }
 
-    const priceInWei = (reserveWETH * (10n ** BigInt(tokenDecimals))) / reserveToken;
+    const priceInWei = (reserveWETH * (10n ** tokenDecimals)) / reserveToken;
     const marketCapInWei = (reserveWETH * tokenTotalSupply) / reserveToken;
 
     return { pairAddress, price: formatEther(priceInWei), marketCap: formatEther(marketCapInWei) };
@@ -134,17 +136,17 @@ async function getTxOptions(value = 0n) {
     const options = { value };
     let effectiveGasPrice;
 
-    const priorityFeeBump = parseUnits(GAS_BUMP_GWEI.toString(), "gwei");
-
     if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
-        options.maxFeePerGas = feeData.maxFeePerGas;
-        options.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + priorityFeeBump;
-        effectiveGasPrice = options.maxFeePerGas; // For calculation
-        log("info", `EIP-1559 Tx: Prio Fee Bumped to ${formatUnits(options.maxPriorityFeePerGas, "gwei")} Gwei`);
+        const priorityBump = (feeData.maxPriorityFeePerGas * BUMP_PERCENT) / 100n;
+        options.maxFeePerGas = feeData.maxFeePerGas + priorityBump;
+        options.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + priorityBump;
+        effectiveGasPrice = options.maxFeePerGas;
+        log("info", `EIP-1559 Tx: Priority Fee Bumped by ${BUMP_PERCENT}% to ${formatUnits(options.maxPriorityFeePerGas, "gwei")} Gwei`);
     } else if (feeData.gasPrice) {
-        options.gasPrice = feeData.gasPrice + priorityFeeBump;
-        effectiveGasPrice = options.gasPrice; // For calculation
-        log("info", `Legacy Tx: Gas Price Bumped to ${formatUnits(options.gasPrice, "gwei")} Gwei`);
+        const gasBump = (feeData.gasPrice * BUMP_PERCENT) / 100n;
+        options.gasPrice = feeData.gasPrice + gasBump;
+        effectiveGasPrice = options.gasPrice;
+        log("info", `Legacy Tx: Gas Price Bumped by ${BUMP_PERCENT}% to ${formatUnits(options.gasPrice, "gwei")} Gwei`);
     } else {
         // Fallback if no fee data is available
         return { gasPrice: undefined, ...options };
@@ -164,7 +166,7 @@ async function getEthPriceInUsd() {
         if (typeof price !== 'number') {
             throw new Error("Invalid price data received from Coingecko");
         }
-        log('info', `Fetched current ETH price: $${price}`);
+        log('info', `Fetched current ETH price: $${price.toFixed(2)}`);
         return price;
     } catch (error) {
         log('warn', `Could not fetch ETH price from Coingecko: ${error.message}. Defaulting to 0.`);
@@ -277,7 +279,7 @@ async function zapInConversation(conversation, ctx) {
                     const estimatedFeeUsd = parseFloat(estimatedFeeEth) * ethPriceUsd;
                     const gasPriceGwei = formatUnits(gasPrice, "gwei");
 
-                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `🚀 Zapping ${ethAmount} ETH... Please wait for blockchain confirmation.\n\n*Final Estimated Fee:*\nGas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei\nTransaction Fee: ~$${estimatedFeeUsd.toFixed(2)}`, {
+                    await ctx.api.editMessageText(ctx.chat.id, mainMessage.message_id, `🚀 Zapping ${ethAmount} ETH... Please wait for blockchain confirmation.\n\n*Final Estimated Fee:*\nGas Price: ~${parseFloat(gasPriceGwei).toFixed(1)} Gwei\nTransaction Fee: ~$${estimatedFeeUsd.toFixed(4)}`, {
                         parse_mode: 'Markdown',
                         reply_markup: undefined
                     }).catch(e => log("warn", "Could not edit message before zapping in:", e));
@@ -505,8 +507,8 @@ bot.callbackQuery(/^execute_zapout:(\d+)$/, async (ctx) => {
         await ctx.editMessageText(
             `⏳ Executing ${percentage}% Zap Out...\n\n` +
             `*Estimated Fee Details:*\n` +
-            `Gas Price: ~${parseFloat(formatUnits(gasPrice, "gwei")).toFixed(2)} Gwei\n` +
-            `Est. Transaction Fee: ~$${estimatedFeeUsd.toFixed(2)}`,
+            `Gas Price: ~${parseFloat(formatUnits(gasPrice, "gwei")).toFixed(1)} Gwei\n` +
+            `Est. Transaction Fee: ~$${estimatedFeeUsd.toFixed(4)}`,
             { parse_mode: 'Markdown' }
         );
 
@@ -576,17 +578,17 @@ async function generateZapInTokenMessage(tokenAddress) {
     const mcapEth = parseFloat(pairInfo.marketCap);
     const mcapUsd = mcapEth * ethPriceUsd;
     const priceEth = parseFloat(pairInfo.price);
-    const priceUsdString = (priceEth * ethPriceUsd).toPrecision(6);
+    const priceUsdString = (priceEth * ethPriceUsd).toPrecision(8);
 
     const messageText = `*Token Found:*
 *Name:* ${tokenInfo.name} (${tokenInfo.symbol})
 *Address:* \`${tokenAddress}\`
-*Market Cap:* ~$${mcapUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-*Price:* ~$${priceUsdString} / ${priceEth.toFixed(12)} ETH
+*Market Cap:* $${mcapUsd.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })}
+*Price:* $${priceUsdString} / ${priceEth.toFixed(18)} ETH
 
 *Current Network Estimate:*
-Gas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei
-Est. Tx Fee: ~$${estimatedFeeUsd.toFixed(2)}
+Gas Price: ${parseFloat(gasPriceGwei).toFixed(1)} Gwei
+Est. Tx Fee: $${estimatedFeeUsd.toFixed(4)}
 
 How much ETH would you like to zap in?
 
@@ -642,21 +644,21 @@ async function generatePositionMessage(position) {
     const estimatedFeeUsd = estimatedFeeEth * ethPriceUsd;
 
     // Formatting for display
-    const formatUsd = (val) => val.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 });
+    const formatUsd = (val) => val.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
     const messageText = `*${tokenInfo.name} (${tokenInfo.symbol})*
-Position Value: ${userLpValueEth.toFixed(4)} ETH (~$${userLpValueUsd.toFixed(2)})
+Position Value: ${userLpValueEth.toFixed(6)} ETH (~$${userLpValueUsd.toFixed(2)})
 *Address:* \`${position.tokenAddress}\`
 
-Initial MarketCap: ~${formatUsd(initialMarketCapUsd)}
-Current MarketCap: ~${formatUsd(currentMarketCapUsd)}
-Token MCAP P/L: ${mcapProfitPercent >= 0 ? '📈 +' : '📉 '}${mcapProfitPercent.toFixed(2)}%
+Initial MarketCap: ${formatUsd(initialMarketCapUsd)}
+Current MarketCap: ${formatUsd(currentMarketCapUsd)}
+Token MCAP P/L: ${mcapProfitPercent >= 0 ? '📈 +' : '📉 '}${mcapProfitPercent.toFixed(4)}%
 
-Pool Share: ${userSharePercent.toFixed(4)}%
+Pool Share: ${userSharePercent.toFixed(6)}%
 
 *Est. Zap Out Details:*
-Gas Price: ~${parseFloat(gasPriceGwei).toFixed(2)} Gwei
-Est. Tx Fee: ~$${estimatedFeeUsd.toFixed(2)}
+Gas Price: ${parseFloat(gasPriceGwei).toFixed(1)} Gwei
+Est. Tx Fee: $${estimatedFeeUsd.toFixed(4)}
 
 _(Last Updated: ${new Date().toLocaleTimeString()})_`;
 

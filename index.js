@@ -584,9 +584,9 @@ async function generateZapInTokenMessage(tokenAddress) {
     ]);
 
     // --- Calculate a GENERAL gas fee estimate ---
-    const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || parseUnits("10", "gwei"); // Use maxFeePerGas for EIP-1559, fallback to gasPrice, then to a default
+    const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || parseUnits("2", "gwei"); // Use maxFeePerGas for EIP-1559, fallback to gasPrice, then to a default
     const gasPriceGwei = formatUnits(gasPrice, "gwei");
-    const ESTIMATED_ZAPIN_GAS_LIMIT = 200000n; // A conservative gas limit for a typical zap-in
+    const ESTIMATED_ZAPIN_GAS_LIMIT = 400000n; // A conservative gas limit for a typical zap-in
     const estimatedFeeWei = ESTIMATED_ZAPIN_GAS_LIMIT * gasPrice;
     const estimatedFeeEth = parseFloat(formatEther(estimatedFeeWei));
     const estimatedFeeUsd = estimatedFeeEth * ethPriceUsd;

@@ -157,20 +157,37 @@ async function getTxOptions(value = 0n) {
 
 async function getEthPriceInUsd() {
     try {
-        const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
-        if (!response.ok) {
-            throw new Error(`Coingecko API call failed with status: ${response.status}`);
+        const USDT_ADDRESS = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
+        const USDT_DECIMALS = 6n;
+        
+        // Get the USDT/WETH pair from Uniswap V2
+        const pairAddress = await factoryContract.getPair(WETH_ADDRESS, USDT_ADDRESS);
+        if (pairAddress === ZeroAddress) {
+            throw new Error("USDT/WETH pair not found");
         }
-        const data = await response.json();
-        const price = data?.ethereum?.usd;
-        if (typeof price !== 'number') {
-            throw new Error("Invalid price data received from Coingecko");
-        }
-        log('info', `Fetched current ETH price: $${price.toFixed(2)}`);
-        return price;
+
+        const pairContract = new Contract(pairAddress, UNISWAP_V2_PAIR_ABI, provider);
+        const [reserves, token0] = await Promise.all([
+            pairContract.getReserves(),
+            pairContract.token0()
+        ]);
+
+        // Determine which reserve is USDT and which is WETH
+        const [usdcReserve, wethReserve] = getAddress(token0) === getAddress(USDT_ADDRESS) 
+            ? [reserves[0], reserves[1]] 
+            : [reserves[1], reserves[0]];
+
+        // Calculate price: (USDT reserve / 10^6) / (WETH reserve / 10^18)
+        const ethPriceInUsd = Number(formatUnits(
+            (usdcReserve * (10n ** 18n)) / wethReserve,
+            USDT_DECIMALS
+        ));
+
+        log('info', `Fetched ETH price from Uniswap: $${ethPriceInUsd.toFixed(2)}`);
+        return ethPriceInUsd;
     } catch (error) {
-        log('warn', `Could not fetch ETH price from Coingecko: ${error.message}. Defaulting to 0.`);
-        return 0; // Return 0 to prevent calculations from failing with NaN
+        log('warn', `Could not fetch ETH price from Uniswap: ${error.message}. Defaulting to 0.`);
+        return 0;
     }
 }
 

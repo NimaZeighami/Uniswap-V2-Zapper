@@ -1,0 +1,13 @@
+# Dependency directory
+node_modules
+
+# Environment variables file (NEVER include in the image)
+.env
+
+# Git files
+.git
+.gitignore
+
+# Log files
+logs
+*.log
